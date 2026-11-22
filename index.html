@@ -800,7 +800,6 @@
     let mqttClient = null;
     let mqttConnected = false;
     let httpsSyncTimer = null;
-    let guestSseSource = null;
     let hostSyncDebounce = null;
     let latestMetaVersion = 0;
     const activeParticipantIds = new Set();
@@ -808,24 +807,7 @@
     const receivedEntryImages = new Map();
     const publishedImageIds = new Set();
     const fetchingImageIds = new Set();
-
-    // Hydrate cached guest images from localStorage for instant reloads
-    try {
-      const cachedImgs = JSON.parse(localStorage.getItem("gsa_guest_img_cache_v2") || "{}");
-      Object.entries(cachedImgs).forEach(([k, v]) => {
-        if (v) receivedEntryImages.set(k, v);
-      });
-    } catch {}
-
-    function saveGuestImageCache() {
-      try {
-        const obj = {};
-        receivedEntryImages.forEach((v, k) => {
-          obj[k] = v;
-        });
-        localStorage.setItem("gsa_guest_img_cache_v2", JSON.stringify(obj));
-      } catch {}
-    }
+    let guestSseSource = null;
 
     // Persistent Voter ID per browser so refreshing does not allow voting twice
     let sessionVoterId = localStorage.getItem(STORAGE_KEY_VOTER_ID);
