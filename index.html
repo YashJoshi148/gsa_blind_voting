@@ -800,7 +800,9 @@
     let mqttClient = null;
     let mqttConnected = false;
     let httpsSyncTimer = null;
+    let guestSseSource = null;
     let hostSyncDebounce = null;
+    let latestMetaVersion = 0;
     const activeParticipantIds = new Set();
     const processedEventIds = new Set();
     const receivedEntryImages = new Map();
@@ -926,12 +928,17 @@
       return {
         type: "META_SYNC",
         msgId: "meta_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+        version: Date.now(),
         sentAt: Date.now(),
-        eventConfig: eventConfig,
+        eventConfig: {
+          title: eventConfig.title || "GSA Creative Showcase",
+          isDeclared: isDeclared,
+          roundId: eventConfig.roundId || "round-1"
+        },
         entriesMeta: entries.map((e) => ({
           id: e.id,
           entryNumber: e.entryNumber,
-          creatorName: isDeclared ? e.creatorName : ""
+          creatorName: isDeclared ? (e.creatorName || "") : ""
         })),
         votes: votes
       };
@@ -955,7 +962,7 @@
           body: JSON.stringify(payloadObj)
         });
         if (res.status === 429) {
-          await new Promise((r) => setTimeout(r, 1200));
+          await new Promise((r) => setTimeout(r, 900));
           const retry = await fetch(`https://ntfy.sh/${encodeURIComponent(activeRoomId)}-${channelSuffix}`, {
             method: "POST",
             body: JSON.stringify(payloadObj)
@@ -968,6 +975,44 @@
       }
     }
 
+    async function publishSingleEntryImage(entry, forceRepublish = false) {
+      if (!entry || !entry.imageUrl || !activeRoomId) return;
+
+      if (mqttClient && mqttConnected) {
+        publishRetainedTopic(
+          `gsa-live/${activeRoomId}/img/${entry.id}`,
+          { type: "ENTRY_IMAGE", entryId: entry.id, imageUrl: entry.imageUrl },
+          true
+        );
+      }
+
+      if (!forceRepublish && publishedImageIds.has(entry.id)) return;
+      publishedImageIds.add(entry.id);
+
+      const raw = entry.imageUrl;
+      const chunkSize = 3600;
+      const total = Math.ceil(raw.length / chunkSize);
+      let allChunksOk = true;
+
+      for (let i = 0; i < total; i++) {
+        const ok = await postHttpsChannel(`img-${entry.id}`, {
+          type: "ENTRY_CHUNK",
+          entryId: entry.id,
+          idx: i,
+          total: total,
+          data: raw.slice(i * chunkSize, (i + 1) * chunkSize)
+        });
+        if (!ok) allChunksOk = false;
+        if (i < total - 1) {
+          await new Promise((r) => setTimeout(r, 60));
+        }
+      }
+
+      if (!allChunksOk) {
+        publishedImageIds.delete(entry.id);
+      }
+    }
+
     async function publishAllEntriesToBroker(forceRepublishImages = false) {
       if (isGuestParticipant || !activeRoomId) return;
 
@@ -976,46 +1021,12 @@
       // 1. Push over Port-443 MQTT WebSocket (instant <300ms push)
       publishRetainedTopic(`gsa-live/${activeRoomId}/meta`, metaPayload, true);
 
-      // 2. Also push lightweight metadata (<2 KB) to standard HTTPS Port-443 relay
+      // 2. Push lightweight metadata (<2 KB) to standard HTTPS Port-443 relay
       await postHttpsChannel("meta", metaPayload);
 
-      // 3. Publish each compressed image on retained MQTT immediately, and pace HTTPS 3.2KB chunks
-      for (const entry of entries) {
-        if (!entry.imageUrl) continue;
-
-        if (mqttClient && mqttConnected) {
-          publishRetainedTopic(
-            `gsa-live/${activeRoomId}/img/${entry.id}`,
-            { type: "ENTRY_IMAGE", entryId: entry.id, imageUrl: entry.imageUrl },
-            true
-          );
-        }
-
-        if (!forceRepublishImages && publishedImageIds.has(entry.id)) continue;
-        publishedImageIds.add(entry.id);
-
-        const raw = entry.imageUrl;
-        const chunkSize = 3200;
-        const total = Math.ceil(raw.length / chunkSize);
-        let allChunksOk = true;
-
-        for (let i = 0; i < total; i++) {
-          const ok = await postHttpsChannel(`img-${entry.id}`, {
-            type: "ENTRY_CHUNK",
-            entryId: entry.id,
-            idx: i,
-            total: total,
-            data: raw.slice(i * chunkSize, (i + 1) * chunkSize)
-          });
-          if (!ok) allChunksOk = false;
-          if (i < total - 1) {
-            await new Promise((r) => setTimeout(r, 160));
-          }
-        }
-
-        if (!allChunksOk) {
-          publishedImageIds.delete(entry.id);
-        }
+      // 3. Publish all entry images in parallel for fast loading on participant devices
+      if (entries.length > 0) {
+        await Promise.all(entries.map((entry) => publishSingleEntryImage(entry, forceRepublishImages)));
       }
     }
 
@@ -1073,19 +1084,26 @@
           const text = await res.text();
           if (!text.trim()) return;
 
-          let latestMeta = null;
+          let newestMeta = null;
+          let highestVer = -1;
           for (const line of text.trim().split("\n")) {
             try {
               const env = JSON.parse(line);
               if (env.event !== "message" || !env.message) continue;
               const msg = JSON.parse(env.message);
-              if (msg.type === "META_SYNC") latestMeta = msg;
+              if (msg.type === "META_SYNC") {
+                const ver = Number(msg.version || msg.sentAt || env.time || 0);
+                if (ver >= highestVer) {
+                  highestVer = ver;
+                  newestMeta = msg;
+                }
+              }
             } catch {}
           }
 
-          if (latestMeta) {
-            applyIncomingGuestMeta(latestMeta);
-            const missingIds = (latestMeta.entriesMeta || [])
+          if (newestMeta) {
+            applyIncomingGuestMeta(newestMeta);
+            const missingIds = (newestMeta.entriesMeta || [])
               .map((m) => m.id)
               .filter((id) => !receivedEntryImages.has(id));
             if (missingIds.length > 0) {
@@ -1113,6 +1131,33 @@
       } catch {}
     }
 
+    function startGuestRealtimeSse() {
+      if (!isGuestParticipant || !activeRoomId || typeof EventSource === "undefined") return;
+      try {
+        if (guestSseSource) guestSseSource.close();
+        guestSseSource = new EventSource(
+          `https://ntfy.sh/${encodeURIComponent(activeRoomId)}-meta/sse?since=all`
+        );
+        guestSseSource.onmessage = async (ev) => {
+          try {
+            const env = JSON.parse(ev.data);
+            if (env.event !== "message" || !env.message) return;
+            const msg = JSON.parse(env.message);
+            if (msg.type === "META_SYNC") {
+              setGuestConnectedBadge();
+              applyIncomingGuestMeta(msg);
+              const missingIds = (msg.entriesMeta || [])
+                .map((m) => m.id)
+                .filter((id) => !receivedEntryImages.has(id));
+              if (missingIds.length > 0) {
+                await Promise.all(missingIds.map((id) => fetchHttpsImageChunks(id)));
+              }
+            }
+          } catch {}
+        };
+      } catch {}
+    }
+
     function subscribeGuestImageTopics(metaList) {
       if (!mqttClient || !mqttConnected || !activeRoomId) return;
       for (const meta of metaList) {
@@ -1136,7 +1181,18 @@
     function applyIncomingGuestMeta(msg) {
       if (!msg || msg.type !== "META_SYNC") return;
 
-      eventConfig = msg.eventConfig || eventConfig;
+      const incomingVer = Number(msg.version || msg.sentAt || 0);
+      if (incomingVer > 0 && incomingVer < latestMetaVersion) {
+        return;
+      }
+      if (incomingVer > latestMetaVersion) {
+        latestMetaVersion = incomingVer;
+      }
+
+      eventConfig = {
+        ...eventConfig,
+        ...(msg.eventConfig || {})
+      };
 
       // Preserve local optimistic vote until host snapshot reflects it
       const serverVotes = msg.votes || [];
@@ -1253,12 +1309,12 @@
       }
 
       if (isSandboxedOrigin) return;
-
-      // Start immediate standard HTTPS (Port 443) sync loop so it NEVER gets stuck on "Connecting..."
+      // Start immediate standard HTTPS (Port 443) sync loop + live SSE push stream
       pollHttpsBackup();
-      httpsSyncTimer = setInterval(pollHttpsBackup, 2500);
+      httpsSyncTimer = setInterval(pollHttpsBackup, 2000);
 
       if (isGuestParticipant) {
+        startGuestRealtimeSse();
         sendGuestJoinPing(true);
         setInterval(() => sendGuestJoinPing(false), 12000);
       } else if (hostStatusEl) {
@@ -1738,7 +1794,7 @@
             canvas.height = h;
             const ctx = canvas.getContext("2d");
             ctx.drawImage(img, 0, 0, w, h);
-            resolve(canvas.toDataURL("image/jpeg", 0.62));
+            resolve(canvas.toDataURL("image/jpeg", 0.55));
           };
           img.src = ev.target.result;
         };
