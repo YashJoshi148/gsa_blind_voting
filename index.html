@@ -764,7 +764,7 @@
     </div>
   </div>
 
-  <!-- App Script: Standalone VS Code / LocalStorage + Multi-Tab Live Sync + Optional Cloud Sync -->
+  <!-- App Script: Standalone VS Code / LocalStorage + Multi-Tab Live Sync + Dual-Engine Multi-Phone Sync -->
   <script type="module">
     const ORGANIZER_PIN = "2026";
     const STORAGE_KEY_CONFIG = "gsa_voting_config_v1";
@@ -795,7 +795,7 @@
     let selectedPreviewDataUrl = null;
     let previousDeclaredState = false;
 
-    // Real-Time Retained MQTT-over-WSS Live Room State (Sub-second push to 50+ phones, zero rate limits)
+    // Dual-Engine Live Room State (Port-443 MQTT WebSocket + Port-443 HTTPS Relay)
     let activeRoomId = null;
     let mqttClient = null;
     let mqttConnected = false;
@@ -890,7 +890,37 @@
       broadcastStateToGuests();
     }
 
-    // ==================== SUB-SECOND REAL-TIME MQTT SYNC (RETAINED STATE + INSTANT PUSH) ====================
+    // ==================== DUAL-ENGINE LIVE ROOM SYNC (MQTT WSS + HTTPS PORT-443) ====================
+    function setGuestConnectedBadge() {
+      const connBadge = document.getElementById("connection-badge");
+      if (!connBadge) return;
+      connBadge.classList.remove("hidden");
+      connBadge.style.background = "#e6f4ea";
+      connBadge.style.borderColor = "#ceead6";
+      connBadge.style.color = "#137333";
+      connBadge.textContent = "🟢 Live Session Connected";
+    }
+
+    function updateConnectedPeersUi() {
+      const pill = document.getElementById("connected-peers-pill");
+      if (pill) {
+        const count = activeParticipantIds.size;
+        pill.textContent = `👥 ${count} ${count === 1 ? "Participant" : "Participants"} Active`;
+      }
+    }
+
+    function broadcastStateToGuests(immediate = false) {
+      if (isGuestParticipant || !activeRoomId) return;
+      if (hostSyncDebounce) clearTimeout(hostSyncDebounce);
+      if (immediate) {
+        publishAllEntriesToBroker(false);
+      } else {
+        hostSyncDebounce = setTimeout(() => {
+          publishAllEntriesToBroker(false);
+        }, 120);
+      }
+    }
+
     function getSanitizedMetaForGuests() {
       const isDeclared = Boolean(eventConfig.isDeclared);
       return {
@@ -917,7 +947,6 @@
       }
     }
 
-    // Standard HTTPS (Port 443) Dual-Channel Backup so campus/mobile firewalls NEVER block live sync or results
     async function postHttpsChannel(channelSuffix, payloadObj) {
       if (!activeRoomId) return false;
       try {
@@ -950,7 +979,7 @@
       // 2. Also push lightweight metadata (<2 KB) to standard HTTPS Port-443 relay
       await postHttpsChannel("meta", metaPayload);
 
-      // 3. Publish each compressed image on retained MQTT immediately, and pace HTTPS 3.2KB chunks to avoid 429 rate limits
+      // 3. Publish each compressed image on retained MQTT immediately, and pace HTTPS 3.2KB chunks
       for (const entry of entries) {
         if (!entry.imageUrl) continue;
 
@@ -989,6 +1018,101 @@
         }
       }
     }
+
+    async function fetchHttpsImageChunks(entryId) {
+      if (!activeRoomId || receivedEntryImages.has(entryId) || fetchingImageIds.has(entryId)) return;
+      fetchingImageIds.add(entryId);
+      try {
+        const res = await fetch(
+          `https://ntfy.sh/${encodeURIComponent(activeRoomId)}-img-${encodeURIComponent(entryId)}/json?poll=1&since=all&_=${Date.now()}`,
+          { cache: "no-store" }
+        );
+        if (!res.ok) return;
+        const text = await res.text();
+        if (!text.trim()) return;
+
+        const chunks = new Map();
+        let expectedTotal = 0;
+        for (const line of text.trim().split("\n")) {
+          try {
+            const env = JSON.parse(line);
+            if (env.event !== "message" || !env.message) continue;
+            const pkt = JSON.parse(env.message);
+            if (pkt.type === "ENTRY_CHUNK" && pkt.entryId === entryId && typeof pkt.idx === "number") {
+              chunks.set(pkt.idx, pkt.data);
+              if (pkt.total) expectedTotal = pkt.total;
+            }
+          } catch {}
+        }
+
+        if (expectedTotal > 0 && chunks.size >= expectedTotal) {
+          let assembled = "";
+          for (let i = 0; i < expectedTotal; i++) {
+            assembled += chunks.get(i) || "";
+          }
+          if (assembled.startsWith("data:")) {
+            handleIncomingGuestImage({ type: "ENTRY_IMAGE", entryId: entryId, imageUrl: assembled });
+          }
+        }
+      } catch {
+      } finally {
+        fetchingImageIds.delete(entryId);
+      }
+    }
+
+    async function pollHttpsBackup() {
+      if (!activeRoomId) return;
+      try {
+        if (isGuestParticipant) {
+          const res = await fetch(
+            `https://ntfy.sh/${encodeURIComponent(activeRoomId)}-meta/json?poll=1&since=all&_=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (!res.ok) return;
+          setGuestConnectedBadge();
+          const text = await res.text();
+          if (!text.trim()) return;
+
+          let latestMeta = null;
+          for (const line of text.trim().split("\n")) {
+            try {
+              const env = JSON.parse(line);
+              if (env.event !== "message" || !env.message) continue;
+              const msg = JSON.parse(env.message);
+              if (msg.type === "META_SYNC") latestMeta = msg;
+            } catch {}
+          }
+
+          if (latestMeta) {
+            applyIncomingGuestMeta(latestMeta);
+            const missingIds = (latestMeta.entriesMeta || [])
+              .map((m) => m.id)
+              .filter((id) => !receivedEntryImages.has(id));
+            if (missingIds.length > 0) {
+              await Promise.all(missingIds.map((id) => fetchHttpsImageChunks(id)));
+            }
+          }
+        } else {
+          const res = await fetch(
+            `https://ntfy.sh/${encodeURIComponent(activeRoomId)}-inbox/json?poll=1&since=all&_=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (!res.ok) return;
+          const text = await res.text();
+          if (!text.trim()) return;
+
+          for (const line of text.trim().split("\n")) {
+            try {
+              const env = JSON.parse(line);
+              if (env.event !== "message" || !env.message) continue;
+              const msg = JSON.parse(env.message);
+              handleHostInboxMessage(msg);
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
     function subscribeGuestImageTopics(metaList) {
       if (!mqttClient || !mqttConnected || !activeRoomId) return;
       for (const meta of metaList) {
@@ -1135,7 +1259,6 @@
       httpsSyncTimer = setInterval(pollHttpsBackup, 2500);
 
       if (isGuestParticipant) {
-        // Announce participant presence immediately & periodically so Organizer sees live participant count
         sendGuestJoinPing(true);
         setInterval(() => sendGuestJoinPing(false), 12000);
       } else if (hostStatusEl) {
@@ -1144,7 +1267,6 @@
 
       if (typeof mqtt === "undefined") return;
 
-      // Use standard Port 443 WSS endpoints (works across corporate/college firewalls & mobile data)
       const brokerUrls = [
         "wss://broker.emqx.io:8084/mqtt",
         "wss://test.mosquitto.org:8081/mqtt",
@@ -1178,26 +1300,6 @@
           if (hostStatusEl) hostStatusEl.textContent = "🟢 Instant Live Sync Active";
           mqttClient.subscribe(`gsa-live/${activeRoomId}/inbox`, { qos: 1 });
           publishAllEntriesToBroker(false);
-        }
-      });
-
-      mqttClient.on("connect", () => {
-        mqttConnected = true;
-        if (isGuestParticipant) {
-          setGuestConnectedBadge();
-          mqttClient.subscribe(`gsa-live/${activeRoomId}/meta`, { qos: 1 });
-          subscribeGuestImageTopics(entries);
-          const joinMsg = {
-            type: "JOIN",
-            msgId: "join_" + sessionVoterId + "_" + Date.now(),
-            voterId: sessionVoterId
-          };
-          publishRetainedTopic(`gsa-live/${activeRoomId}/inbox`, joinMsg, false);
-          postHttpsChannel("inbox", joinMsg);
-        } else {
-          if (hostStatusEl) hostStatusEl.textContent = "🟢 Instant Live Sync Active";
-          mqttClient.subscribe(`gsa-live/${activeRoomId}/inbox`, { qos: 1 });
-          publishAllEntriesToBroker(true);
         }
       });
 
@@ -1253,6 +1355,7 @@
       } else {
         entries = entries.filter((e) => e.id !== entryId);
         votes = votes.filter((v) => v.entryId !== entryId);
+        publishedImageIds.delete(entryId);
         persistLocalState();
         renderAll();
       }
@@ -1311,7 +1414,6 @@
       const totalVotesCount = activeVotes.length;
       const isDeclared = Boolean(eventConfig.isDeclared);
 
-      // Update Header
       const titleEl = document.getElementById("header-event-title");
       if (titleEl) titleEl.textContent = eventConfig.title || "GSA Creative Showcase";
 
@@ -1323,7 +1425,6 @@
       const headerVotesEl = document.getElementById("header-total-votes");
       if (headerVotesEl) headerVotesEl.textContent = String(totalVotesCount);
 
-      // Compute vote counts per entry
       const sortedEntries = [...entries].sort((a, b) => (a.entryNumber || 0) - (b.entryNumber || 0));
       const enriched = sortedEntries.map((entry) => {
         const count = activeVotes.filter((v) => v.entryId === entry.id).length;
@@ -1334,13 +1435,11 @@
       const rankedByVotes = [...enriched].sort((a, b) => b.voteCount - a.voteCount || a.entryNumber - b.entryNumber);
       const topWinner = rankedByVotes.length > 0 && rankedByVotes[0].voteCount > 0 ? rankedByVotes[0] : rankedByVotes[0] || null;
 
-      // Confetti burst when transitioning into declared state
       if (isDeclared && !previousDeclaredState && topWinner && typeof confetti === "function") {
         confetti({ particleCount: 110, spread: 75, origin: { y: 0.6 } });
       }
       previousDeclaredState = isDeclared;
 
-      // Winner Banner
       const winnerBanner = document.getElementById("winner-banner");
       if (isDeclared && topWinner) {
         winnerBanner.classList.remove("hidden");
@@ -1354,7 +1453,6 @@
         winnerBanner.classList.add("hidden");
       }
 
-      // Participant Status Card
       const myVote = activeVotes.find((v) => v.id === sessionVoterId);
       const userVotePill = document.getElementById("user-vote-pill");
       const statusHeading = document.getElementById("status-heading");
@@ -1381,7 +1479,6 @@
         userVotePill.classList.add("hidden");
       }
 
-      // Empty State vs Gallery Grid
       const emptyState = document.getElementById("empty-gallery-state");
       const gridEl = document.getElementById("entries-grid");
 
@@ -1448,7 +1545,6 @@
           .join("");
       }
 
-      // Admin Controls & Secret Leaderboard
       const declareBtnText = document.getElementById("declare-winner-btn-text");
       if (declareBtnText) {
         declareBtnText.textContent = isDeclared ? "Reopen Blind Voting" : "Declare Winner & Reveal Names";
@@ -1857,6 +1953,7 @@
       } else {
         entries = [];
         votes = [];
+        publishedImageIds.clear();
         eventConfig.isDeclared = false;
         eventConfig.roundId = `round_${Date.now()}`;
         persistLocalState();
@@ -1893,7 +1990,6 @@
         const rawDb = getFirestore(app);
         auth = getAuth(app);
 
-        // Lightweight wrapper so db.doc() works seamlessly
         db = {
           doc: (path) => doc(rawDb, ...path.split("/")),
           batch: () => writeBatch(rawDb)
